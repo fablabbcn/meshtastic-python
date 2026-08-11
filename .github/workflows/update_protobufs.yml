@@ -1,5 +1,15 @@
 name: "Update protobufs"
-on: workflow_dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Protobufs version tag to sync to (e.g., v2.7.26). Defaults to the latest protobufs release."
+        required: false
+        default: ""
+        type: string
+  repository_dispatch:
+    types: [protobufs-release]
 
 permissions:
   contents: write
@@ -25,11 +35,35 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install poetry
 
-      - name: Update protobuf submodule
+      - name: Determine target protobufs version
+        id: version
+        run: |
+          cd protobufs
+          git fetch --tags
+
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            target="${{ github.event.inputs.version }}"
+          elif [ -n "${{ github.event.client_payload.version }}" ]; then
+            target="${{ github.event.client_payload.version }}"
+          else
+            target=$(git describe --tags --abbrev=0)
+          fi
+
+          if ! git rev-parse --verify "refs/tags/${target}" >/dev/null 2>&1; then
+            echo "Error: '${target}' is not a valid tag in meshtastic/protobufs"
+            exit 1
+          fi
+
+          echo "version=${target}" >> "$GITHUB_OUTPUT"
+          echo "Target protobufs version: ${target}"
+
+      - name: Update protobuf submodule to release
         run: |
           git submodule sync --recursive
           git submodule update --init --recursive
-          git submodule update --remote --recursive
+          cd protobufs
+          git checkout ${{ steps.version.outputs.version }}
+          cd ..
 
       - name: Download nanopb
         run: |
@@ -53,7 +87,7 @@ jobs:
           git add protobufs
           git add meshtastic/protobuf
           if [[ -n "$(git status --porcelain)" ]]; then
-            git commit -m "Update protobufs"
+            git commit -m "protobufs: ${{ steps.version.outputs.version }}"
             git push
           else
             echo "No changes to commit"
