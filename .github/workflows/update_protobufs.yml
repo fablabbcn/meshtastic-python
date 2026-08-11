@@ -24,6 +24,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: true
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -37,32 +38,41 @@ jobs:
 
       - name: Determine target protobufs version
         id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
         run: |
           cd protobufs
           git fetch --tags
 
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            target="${{ github.event.inputs.version }}"
-          elif [ -n "${{ github.event.client_payload.version }}" ]; then
-            target="${{ github.event.client_payload.version }}"
+          if [ -n "${INPUT_VERSION}" ]; then
+            target="${INPUT_VERSION}"
+          elif [ -n "${PAYLOAD_VERSION}" ]; then
+            target="${PAYLOAD_VERSION}"
           else
-            target=$(git describe --tags --abbrev=0)
+            target=$(git tag --list 'v*' --sort=-version:refname | head -n1)
+            if [ -z "${target}" ]; then
+              echo "Error: no release tags found in meshtastic/protobufs"
+              exit 1
+            fi
           fi
 
-          if ! git rev-parse --verify "refs/tags/${target}" >/dev/null 2>&1; then
+          if ! git show-ref --verify --quiet "refs/tags/${target}"; then
             echo "Error: '${target}' is not a valid tag in meshtastic/protobufs"
             exit 1
           fi
 
-          echo "version=${target}" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "${target}" >> "$GITHUB_OUTPUT"
           echo "Target protobufs version: ${target}"
 
       - name: Update protobuf submodule to release
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
         run: |
           git submodule sync --recursive
           git submodule update --init --recursive
           cd protobufs
-          git checkout ${{ steps.version.outputs.version }}
+          git checkout "${TARGET_VERSION}"
           cd ..
 
       - name: Download nanopb
@@ -80,6 +90,8 @@ jobs:
           ./bin/regen-protobufs.sh
 
       - name: Commit update
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
         run: |
           git config --global user.name 'github-actions'
           git config --global user.email 'bot@noreply.github.com'
@@ -87,7 +99,7 @@ jobs:
           git add protobufs
           git add meshtastic/protobuf
           if [[ -n "$(git status --porcelain)" ]]; then
-            git commit -m "protobufs: ${{ steps.version.outputs.version }}"
+            git commit -m "protobufs: ${TARGET_VERSION}"
             git push
           else
             echo "No changes to commit"
