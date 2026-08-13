@@ -5,8 +5,10 @@
 # later we can have a separate changelist to refactor main.py into smaller files
 # pylint: disable=R0917,C0302
 
-from typing import List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 from types import ModuleType
+
+from decimal import Decimal
 
 import argparse
 
@@ -61,10 +63,18 @@ except ImportError as e:
     have_powermon = False
     powermon_exception = e
     meter = None
-from meshtastic.protobuf import admin_pb2, channel_pb2, config_pb2, portnums_pb2, mesh_pb2
+from meshtastic.protobuf import admin_pb2, channel_pb2, clientonly_pb2, config_pb2, portnums_pb2, mesh_pb2
 from meshtastic.version import get_active_version
 
 logger = logging.getLogger(__name__)
+
+# Map dotted preference paths to the protobuf enum that defines their flags.
+# These fields are stored as uint32 bitmasks in the protobuf but have an
+# associated enum that names the individual flags.
+BITFIELD_ENUMS = {
+    "network.enabled_protocols": config_pb2.Config.NetworkConfig.ProtocolFlags,
+    "position.position_flags": config_pb2.Config.PositionConfig.PositionFlags,
+}
 
 def onReceive(packet, interface) -> None:
     """Callback invoked when a packet arrives"""
@@ -86,12 +96,17 @@ def onReceive(packet, interface) -> None:
         if d is not None and args and args.reply:
             msg = d.get("text")
             if msg:
-                rxSnr = packet["rxSnr"]
-                hopLimit = packet["hopLimit"]
-                print(f"message: {msg}")
-                reply = f"got msg '{msg}' with rxSnr: {rxSnr} and hopLimit: {hopLimit}"
-                print("Sending reply: ", reply)
-                interface.sendText(reply)
+                rxChannel = packet.get("channel", 0)
+                targetChannel = int(args.ch_index or 0)
+                if rxChannel == targetChannel:
+                    rxSnr = packet["rxSnr"]
+                    hopLimit = packet["hopLimit"]
+                    print(f"message: {msg}")
+                    reply = f"got msg '{msg}' with rxSnr: {rxSnr} and hopLimit: {hopLimit}"
+                    print(f"Received channel {rxChannel}. Sending reply: {reply}")
+                    interface.sendText(reply,channelIndex=rxChannel)
+                else:
+                    print(f"Ignored message on channel {rxChannel} (waiting for channel {targetChannel})")
 
     except Exception as ex:
         print(f"Warning: Error processing received packet: {ex}.")
@@ -233,13 +248,28 @@ def setPref(config, comp_name, raw_val) -> bool:
         print("Warning: network.wifi_psk must be 8 or more characters.")
         return False
 
+    # Handle uint32 bitfields that have an associated enum of flag names.
+    bitfield_enum = None
+    if config_type.message_type is not None:
+        bitfield_path = f"{config_type.name}.{pref.name}"
+        bitfield_enum = BITFIELD_ENUMS.get(bitfield_path)
+    if bitfield_enum and isinstance(val, str):
+        # At this point fromStr() could not parse val as int/float/bool/bytes,
+        # so treat it as a comma-separated list of bitfield flag names.
+        flag_names = [name.strip() for name in val.split(",") if name.strip()]
+        try:
+            val = meshtastic.util.flags_from_list(bitfield_enum, flag_names)
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            return False
+
     enumType = pref.enum_type
     # pylint: disable=C0123
     if enumType and type(val) == str:
         # We've failed so far to convert this string into an enum, try to find it by reflection
-        e = enumType.values_by_name.get(val)
-        if e:
-            val = e.number
+        ev = enumType.values_by_name.get(val)
+        if ev:
+            val = ev.number
         else:
             print(
                 f"{name[0]}.{uni_name} does not have an enum called {val}, so you can not set it."
@@ -547,6 +577,13 @@ def onConnected(interface):
             waitForAckNak = True
             interface.getNode(args.dest, False, **getNode_kwargs).resetNodeDb()
 
+        if args.add_contact:
+            closeNow = True
+            waitForAckNak = True
+            interface.getNode(args.dest, False, **getNode_kwargs).addContactURL(
+                args.add_contact
+            )
+
         if args.sendtext:
             closeNow = True
             channelIndex = mt_config.channel_index or 0
@@ -707,115 +744,105 @@ def onConnected(interface):
                 printConfig(node.moduleConfig)
 
         if args.configure:
-            with open(args.configure[0], encoding="utf8") as file:
-                configuration = yaml.safe_load(file)
-                closeNow = True
+            if args.dest != BROADCAST_ADDR:
+                print("Configuring remote nodes is not supported.")
+                return
 
-                interface.getNode(args.dest, False, **getNode_kwargs).beginSettingsTransaction()
+            filename = args.configure[0]
+            fmt = getattr(args, "export_format", "auto")
 
-                if "owner" in configuration:
-                    # Validate owner name before setting
-                    owner_name = str(configuration["owner"]).strip()
-                    if not owner_name:
-                        meshtastic.util.our_exit("ERROR: Long Name cannot be empty or contain only whitespace characters")
-                    print(f"Setting device owner to {configuration['owner']}")
-                    waitForAckNak = True
-                    interface.getNode(args.dest, False, **getNode_kwargs).setOwner(configuration["owner"])
-                    time.sleep(0.5)
+            def _seed_config(section: str, is_module: bool) -> Optional[Any]:
+                """Return the current local-node config section, if present."""
+                config_obj = (
+                    interface.localNode.moduleConfig
+                    if is_module
+                    else interface.localNode.localConfig
+                )
+                return getattr(config_obj, section) if config_obj.HasField(section) else None
 
-                if "owner_short" in configuration:
-                    # Validate owner short name before setting
-                    owner_short_name = str(configuration["owner_short"]).strip()
-                    if not owner_short_name:
-                        meshtastic.util.our_exit("ERROR: Short Name cannot be empty or contain only whitespace characters")
-                    print(
-                        f"Setting device owner short to {configuration['owner_short']}"
-                    )
-                    waitForAckNak = True
-                    interface.getNode(args.dest, False, **getNode_kwargs).setOwner(
-                        long_name=None, short_name=configuration["owner_short"]
-                    )
-                    time.sleep(0.5)
+            profile = _read_profile(filename, fmt, seed_fn=_seed_config)
 
-                if "ownerShort" in configuration:
-                    # Validate owner short name before setting
-                    owner_short_name = str(configuration["ownerShort"]).strip()
-                    if not owner_short_name:
-                        meshtastic.util.our_exit("ERROR: Short Name cannot be empty or contain only whitespace characters")
-                    print(
-                        f"Setting device owner short to {configuration['ownerShort']}"
-                    )
-                    waitForAckNak = True
-                    interface.getNode(args.dest, False, **getNode_kwargs).setOwner(
-                        long_name=None, short_name=configuration["ownerShort"]
-                    )
-                    time.sleep(0.5)
+            closeNow = True
+            interface.getNode(args.dest, False, **getNode_kwargs).beginSettingsTransaction()
 
-                if "channel_url" in configuration:
-                    print("Setting channel url to", configuration["channel_url"])
-                    interface.getNode(args.dest, **getNode_kwargs).setURL(configuration["channel_url"])
-                    time.sleep(0.5)
+            # Owner: combine long_name and short_name into a single setOwner call.
+            # NOTE: is_licensed and is_unmessagable are not yet in DeviceProfile;
+            # ref: https://github.com/meshtastic/protobufs/pull/971
+            long_name = str(profile.long_name).strip() if profile.long_name else None
+            short_name = str(profile.short_name).strip() if profile.short_name else None
 
-                if "channelUrl" in configuration:
-                    print("Setting channel url to", configuration["channelUrl"])
-                    interface.getNode(args.dest, **getNode_kwargs).setURL(configuration["channelUrl"])
-                    time.sleep(0.5)
+            if long_name is not None and not long_name:
+                meshtastic.util.our_exit("ERROR: Long Name cannot be empty or contain only whitespace characters")
+            if short_name is not None and not short_name:
+                meshtastic.util.our_exit("ERROR: Short Name cannot be empty or contain only whitespace characters")
 
-                if "canned_messages" in configuration:
-                    print("Setting canned message messages to", configuration["canned_messages"])
-                    interface.getNode(args.dest, **getNode_kwargs).set_canned_message(configuration["canned_messages"])
-                    time.sleep(0.5)
+            if long_name or short_name:
+                if long_name and short_name:
+                    print(f"Setting device owner to {long_name} and short name to {short_name}")
+                elif long_name:
+                    print(f"Setting device owner to {long_name}")
+                else:
+                    print(f"Setting device owner short to {short_name}")
+                waitForAckNak = True
+                interface.getNode(args.dest, False, **getNode_kwargs).setOwner(
+                    long_name=long_name, short_name=short_name
+                )
+                time.sleep(0.5)
 
-                if "ringtone" in configuration:
-                    print("Setting ringtone to", configuration["ringtone"])
-                    interface.getNode(args.dest, **getNode_kwargs).set_ringtone(configuration["ringtone"])
-                    time.sleep(0.5)
+            if profile.channel_url:
+                print(f"Setting channel url to {profile.channel_url}")
+                interface.getNode(args.dest, **getNode_kwargs).setURL(profile.channel_url)
+                time.sleep(0.5)
 
-                if "location" in configuration:
-                    alt = 0
-                    lat = 0.0
-                    lon = 0.0
-                    localConfig = interface.localNode.localConfig
+            if profile.canned_messages:
+                print(f"Setting canned message messages to {profile.canned_messages}")
+                interface.getNode(args.dest, **getNode_kwargs).set_canned_message(profile.canned_messages)
+                time.sleep(0.5)
 
-                    if "alt" in configuration["location"]:
-                        alt = int(configuration["location"]["alt"] or 0)
-                        print(f"Fixing altitude at {alt} meters")
-                    if "lat" in configuration["location"]:
-                        lat = float(configuration["location"]["lat"] or 0)
-                        print(f"Fixing latitude at {lat} degrees")
-                    if "lon" in configuration["location"]:
-                        lon = float(configuration["location"]["lon"] or 0)
-                        print(f"Fixing longitude at {lon} degrees")
+            if profile.ringtone:
+                print(f"Setting ringtone to {profile.ringtone}")
+                interface.getNode(args.dest, **getNode_kwargs).set_ringtone(profile.ringtone)
+                time.sleep(0.5)
+
+            if profile.HasField("fixed_position"):
+                # Only send the admin message when the position config
+                # explicitly opts into fixed_position.  The admin message
+                # unconditionally enables the flag on the device, so we
+                # require an explicit opt-in from the profile's config.
+                if (
+                    profile.HasField("config")
+                    and profile.config.HasField("position")
+                    and profile.config.position.fixed_position
+                ):
+                    pos = profile.fixed_position
+                    lat = float(pos.latitude_i * Decimal("1e-7")) if pos.latitude_i else 0.0
+                    lon = float(pos.longitude_i * Decimal("1e-7")) if pos.longitude_i else 0.0
+                    alt = pos.altitude if pos.altitude else 0
+                    print(f"Fixing altitude at {alt} meters")
+                    print(f"Fixing latitude at {lat} degrees")
+                    print(f"Fixing longitude at {lon} degrees")
                     print("Setting device position")
-                    interface.localNode.setFixedPosition(lat, lon, alt)
+                    interface.getNode(args.dest, False, **getNode_kwargs).setFixedPosition(lat, lon, alt)
                     time.sleep(0.5)
 
-                if "config" in configuration:
-                    localConfig = interface.getNode(args.dest, **getNode_kwargs).localConfig
-                    for section in configuration["config"]:
-                        traverseConfig(
-                            section, configuration["config"][section], localConfig
-                        )
-                        interface.getNode(args.dest, **getNode_kwargs).writeConfig(
-                            meshtastic.util.camel_to_snake(section)
-                        )
+            if profile.HasField("config"):
+                localConfig = interface.getNode(args.dest, **getNode_kwargs).localConfig
+                for field in profile.config.DESCRIPTOR.fields:
+                    if field.message_type is not None and profile.config.HasField(field.name):
+                        getattr(localConfig, field.name).CopyFrom(getattr(profile.config, field.name))
+                        interface.getNode(args.dest, **getNode_kwargs).writeConfig(field.name)
                         time.sleep(0.5)
 
-                if "module_config" in configuration:
-                    moduleConfig = interface.getNode(args.dest, **getNode_kwargs).moduleConfig
-                    for section in configuration["module_config"]:
-                        traverseConfig(
-                            section,
-                            configuration["module_config"][section],
-                            moduleConfig,
-                        )
-                        interface.getNode(args.dest, **getNode_kwargs).writeConfig(
-                            meshtastic.util.camel_to_snake(section)
-                        )
+            if profile.HasField("module_config"):
+                moduleConfig = interface.getNode(args.dest, **getNode_kwargs).moduleConfig
+                for field in profile.module_config.DESCRIPTOR.fields:
+                    if field.message_type is not None and profile.module_config.HasField(field.name):
+                        getattr(moduleConfig, field.name).CopyFrom(getattr(profile.module_config, field.name))
+                        interface.getNode(args.dest, **getNode_kwargs).writeConfig(field.name)
                         time.sleep(0.5)
 
-                interface.getNode(args.dest, False, **getNode_kwargs).commitSettingsTransaction()
-                print("Writing modified configuration to device")
+            interface.getNode(args.dest, False, **getNode_kwargs).commitSettingsTransaction()
+            print("Writing modified configuration to device")
 
         if args.export_config:
             if args.dest != BROADCAST_ADDR:
@@ -823,18 +850,40 @@ def onConnected(interface):
                 return
 
             closeNow = True
-            config_txt = export_config(interface)
 
-            if args.export_config == "-":
-                # Output to stdout (preserves legacy use of `> file.yaml`)
-                print(config_txt)
+            is_binary = False
+            fmt = getattr(args, "export_format", "auto")
+            if fmt in ("binary", "protobuf"):
+                is_binary = True
+            elif fmt == "yaml":
+                is_binary = False
             else:
-                try:
-                    with open(args.export_config, "w", encoding="utf-8") as f:
-                        f.write(config_txt)
-                    print(f"Exported configuration to {args.export_config}")
-                except Exception as e:
-                    meshtastic.util.our_exit(f"ERROR: Failed to write config file: {e}")
+                is_binary = args.export_config.endswith(".cfg")
+
+            if is_binary:
+                config_bytes = export_profile(interface)
+                if args.export_config == "-":
+                    sys.stdout.buffer.write(config_bytes)
+                else:
+                    try:
+                        with open(args.export_config, "wb") as f:
+                            f.write(config_bytes)
+                        print(f"Exported profile to {args.export_config}")
+                    except Exception as e:
+                        meshtastic.util.our_exit(f"ERROR: Failed to write profile file: {e}")
+            else:
+                config_txt = export_config(interface)
+
+                if args.export_config == "-":
+                    # Output to stdout (preserves legacy use of `> file.yaml`)
+                    print(config_txt)
+                else:
+                    try:
+                        with open(args.export_config, "w", encoding="utf-8") as f:
+                            f.write(config_txt)
+                        print(f"Exported configuration to {args.export_config}")
+                    except Exception as e:
+                        meshtastic.util.our_exit(f"ERROR: Failed to write config file: {e}")
 
         if args.ch_set_url:
             closeNow = True
@@ -920,8 +969,14 @@ def onConnected(interface):
         if args.ch_longslow:
             setSimpleConfig(config_pb2.Config.LoRaConfig.ModemPreset.LONG_SLOW)
 
+        if args.ch_longmod:
+            setSimpleConfig(config_pb2.Config.LoRaConfig.ModemPreset.LONG_MODERATE)
+
         if args.ch_longfast:
             setSimpleConfig(config_pb2.Config.LoRaConfig.ModemPreset.LONG_FAST)
+
+        if args.ch_longturbo:
+            setSimpleConfig(config_pb2.Config.LoRaConfig.ModemPreset.LONG_TURBO)
 
         if args.ch_medslow:
             setSimpleConfig(config_pb2.Config.LoRaConfig.ModemPreset.MEDIUM_SLOW)
@@ -934,6 +989,9 @@ def onConnected(interface):
 
         if args.ch_shortfast:
             setSimpleConfig(config_pb2.Config.LoRaConfig.ModemPreset.SHORT_FAST)
+
+        if args.ch_shortturbo:
+            setSimpleConfig(config_pb2.Config.LoRaConfig.ModemPreset.SHORT_TURBO)
 
         if args.ch_set or args.ch_enable or args.ch_disable:
             closeNow = True
@@ -1063,6 +1121,20 @@ def onConnected(interface):
             else:
                 urldesc = "Primary channel URL"
             print(f"{urldesc}: {url}")
+            if pyqrcode is not None:
+                qr = pyqrcode.create(url)
+                print(qr.terminal())
+            else:
+                print("Install pyqrcode to view a QR code printed to terminal.")
+
+        if args.contact_qr:
+            closeNow = True
+            url = interface.getNode(args.dest, True, **getNode_kwargs).getContactURL(
+                args.contact_qr,
+                should_ignore=args.contact_ignore,
+                manually_verified=args.contact_verified,
+            )
+            print(f"Contact URL: {url}")
             if pyqrcode is not None:
                 qr = pyqrcode.create(url)
                 print(qr.terminal())
@@ -1214,7 +1286,7 @@ def export_config(interface) -> str:
     lat = None
     lon = None
     alt = None
-    if pos:
+    if pos and interface.localNode.localConfig.position.fixed_position:
         lat = pos.get("latitude")
         lon = pos.get("longitude")
         alt = pos.get("altitude")
@@ -1258,7 +1330,7 @@ def export_config(interface) -> str:
                     for i in range(len(prefs[pref]['adminKey'])):
                         prefs[pref]['adminKey'][i] = 'base64:' + prefs[pref]['adminKey'][i]
         if mt_config.camel_case:
-            configObj["config"] = config		#Identical command here and 2 lines below?
+            configObj["config"] = prefs
         else:
             configObj["config"] = config
 
@@ -1282,6 +1354,162 @@ def export_config(interface) -> str:
                                                                         #was used as a string here and a Dictionary above
     config_txt += yaml.dump(configObj)
     return config_txt
+
+def _set_if_populated(profile, field_name, value):
+    if value is None:
+        return
+    val = str(value).strip()
+    if val:
+        setattr(profile, field_name, val)
+
+
+def _profile_from_yaml(
+    configuration: dict,
+    seed_fn: Optional[Callable[[str, bool], Optional[Any]]] = None,
+) -> clientonly_pb2.DeviceProfile:
+    """Convert a YAML config dict to a DeviceProfile protobuf for uniform import.
+
+    If seed_fn is provided, it is called for each config/module_config section
+    before applying YAML values.  It should return the current protobuf message
+    for that section (or None) so that unmentioned fields are preserved.
+    """
+    profile = clientonly_pb2.DeviceProfile()
+    if "owner" in configuration:
+        _set_if_populated(profile, "long_name", configuration["owner"])
+    if "owner_short" in configuration:
+        _set_if_populated(profile, "short_name", configuration["owner_short"])
+    elif "ownerShort" in configuration:
+        _set_if_populated(profile, "short_name", configuration["ownerShort"])
+    if "channel_url" in configuration:
+        _set_if_populated(profile, "channel_url", configuration["channel_url"])
+    elif "channelUrl" in configuration:
+        _set_if_populated(profile, "channel_url", configuration["channelUrl"])
+    if "canned_messages" in configuration:
+        _set_if_populated(profile, "canned_messages", configuration["canned_messages"])
+    if "ringtone" in configuration:
+        _set_if_populated(profile, "ringtone", configuration["ringtone"])
+    loc = configuration.get("location")
+    if loc:
+        lat = float(loc.get("lat", 0) or 0)
+        lon = float(loc.get("lon", 0) or 0)
+        alt = int(loc.get("alt", 0) or 0)
+        if lat or lon or alt:
+            profile.fixed_position.latitude_i = int(Decimal(str(lat)) * Decimal("1e7"))
+            profile.fixed_position.longitude_i = int(Decimal(str(lon)) * Decimal("1e7"))
+            profile.fixed_position.altitude = alt
+    if "config" in configuration:
+        for section in configuration["config"]:
+            section_snake = meshtastic.util.camel_to_snake(section)
+            if seed_fn is not None:
+                seeded = seed_fn(section_snake, False)
+                if seeded is not None:
+                    getattr(profile.config, section_snake).CopyFrom(seeded)
+            traverseConfig(section, configuration["config"][section], profile.config)
+    if "module_config" in configuration:
+        for section in configuration["module_config"]:
+            section_snake = meshtastic.util.camel_to_snake(section)
+            if seed_fn is not None:
+                seeded = seed_fn(section_snake, True)
+                if seeded is not None:
+                    getattr(profile.module_config, section_snake).CopyFrom(seeded)
+            traverseConfig(section, configuration["module_config"][section], profile.module_config)
+    return profile
+
+
+def _read_profile(
+    filename: str,
+    fmt: str,
+    seed_fn: Optional[Callable[[str, bool], Optional[Any]]] = None,
+) -> clientonly_pb2.DeviceProfile:
+    """Read a config file and return a DeviceProfile, autodetecting format by content."""
+    with open(filename, "rb") as f:
+        raw = f.read()
+
+    if fmt in ("binary", "protobuf"):
+        try:
+            return _parse_profile_bytes(raw)
+        except Exception as e:
+            meshtastic.util.our_exit(
+                f"ERROR: {filename} is not a valid DeviceProfile (.cfg) file: {e}"
+            )
+
+    if fmt == "yaml":
+        try:
+            configuration = yaml.safe_load(raw.decode("utf8"))
+        except (UnicodeDecodeError, yaml.YAMLError) as e:
+            meshtastic.util.our_exit(
+                f"ERROR: {filename} is not a valid YAML config (expected UTF-8 YAML): {e}"
+            )
+        if not isinstance(configuration, dict):
+            meshtastic.util.our_exit(
+                f"ERROR: {filename} is not a valid YAML config (expected a mapping)."
+            )
+        return _profile_from_yaml(configuration, seed_fn=seed_fn)
+
+    # Auto: try YAML first (text files), fall back to protobuf (binary files).
+    try:
+        configuration = yaml.safe_load(raw.decode("utf8"))
+        if isinstance(configuration, dict):
+            return _profile_from_yaml(configuration, seed_fn=seed_fn)
+    except (UnicodeDecodeError, yaml.YAMLError):
+        pass
+
+    try:
+        return _parse_profile_bytes(raw)
+    except Exception as e:
+        meshtastic.util.our_exit(
+            f"ERROR: {filename} is not a valid YAML config or DeviceProfile (.cfg) file: {e}"
+        )
+
+
+def _parse_profile_bytes(raw: bytes) -> clientonly_pb2.DeviceProfile:
+    """Parse raw bytes as a DeviceProfile protobuf, raising on failure."""
+    profile = clientonly_pb2.DeviceProfile()
+    profile.ParseFromString(raw)
+    return profile
+
+
+def export_profile(interface) -> bytes:
+    """used in --export-config for binary .cfg files"""
+    profile = clientonly_pb2.DeviceProfile()
+
+    owner = interface.getLongName()
+    owner_short = interface.getShortName()
+    channel_url = interface.localNode.getURL()
+    myinfo = interface.getMyNodeInfo()
+    canned_messages = interface.getCannedMessage()
+    ringtone = interface.getRingtone()
+
+    if owner:
+        profile.long_name = owner
+    if owner_short:
+        profile.short_name = owner_short
+    if channel_url:
+        profile.channel_url = channel_url
+    if canned_messages:
+        profile.canned_messages = canned_messages
+    if ringtone:
+        profile.ringtone = ringtone
+
+    profile.config.CopyFrom(interface.localNode.localConfig)
+    profile.module_config.CopyFrom(interface.localNode.moduleConfig)
+
+    if interface.localNode.localConfig.position.fixed_position:
+        pos = myinfo.get("position")
+        if pos:
+            lat = pos.get("latitude")
+            lon = pos.get("longitude")
+            alt = pos.get("altitude")
+
+            if lat or lon or alt:
+                if lat:
+                    profile.fixed_position.latitude_i = int(Decimal(str(lat)) * Decimal("1e7"))
+                if lon:
+                    profile.fixed_position.longitude_i = int(Decimal(str(lon)) * Decimal("1e7"))
+                if alt:
+                    profile.fixed_position.altitude = int(alt)
+
+    return profile.SerializeToString()
 
 
 def create_power_meter():
@@ -1357,6 +1585,17 @@ def common():
             if not stripped_ham_name:
                 meshtastic.util.our_exit("ERROR: Ham radio callsign cannot be empty or contain only whitespace characters")
 
+        # Early validation for OTA firmware file before attempting device connection
+        if hasattr(args, 'ota_update') and args.ota_update is not None:
+            if not os.path.isfile(args.ota_update):
+                meshtastic.util.our_exit(f"Error: OTA firmware file not found: {args.ota_update}", 1)
+
+        # OTA (WiFi/BLE) only needs the local node to send the admin request and then
+        # streams the firmware directly; it never reads the node DB. Skip fetching it so a
+        # large node DB dump can't stall/close the connection before the OTA request lands.
+        if getattr(args, "ota_update", None) or getattr(args, "reboot_ota", False):
+            args.no_nodes = True
+
         if have_powermon:
             create_power_meter()
 
@@ -1409,13 +1648,59 @@ def common():
                     print(f"Found: name='{x.name}' address='{x.address}'")
                 meshtastic.util.our_exit("BLE scan finished", 0)
             elif args.ble:
-                client = BLEInterface(
-                    args.ble if args.ble != "any" else None,
-                    debugOut=logfile,
-                    noProto=args.noproto,
-                    noNodes=args.no_nodes,
-                    timeout=args.timeout,
-                )
+                try:
+                    client = BLEInterface(
+                        args.ble if args.ble != "any" else None,
+                        debugOut=logfile,
+                        noProto=args.noproto,
+                        noNodes=args.no_nodes,
+                        timeout=args.timeout,
+                    )
+                except BLEInterface.BLEError as e:
+                    if e.kind == BLEInterface.BLEError.DEVICE_NOT_FOUND:
+                        meshtastic.util.our_exit(
+                            "BLE device not found.\n\n"
+                            "Possible causes:\n"
+                            "  - Bluetooth is disabled on the Meshtastic device\n"
+                            "  - Device is in deep sleep mode\n"
+                            "  - Device is out of range\n\n"
+                            "Try:\n"
+                            "  - Press the reset button on your device\n"
+                            "  - Run 'meshtastic --ble-scan' to see available devices",
+                            1,
+                        )
+                    elif e.kind == BLEInterface.BLEError.MULTIPLE_DEVICES:
+                        meshtastic.util.our_exit(
+                            "Multiple Meshtastic BLE devices found.\n\n"
+                            "Please specify which device to connect to:\n"
+                            "  - Run 'meshtastic --ble-scan' to list devices\n"
+                            "  - Use 'meshtastic --ble <name_or_address>' to connect",
+                            1,
+                        )
+                    elif e.kind == BLEInterface.BLEError.WRITE_ERROR:
+                        meshtastic.util.our_exit(
+                            "Failed to write to BLE device.\n\n"
+                            "Possible causes:\n"
+                            "  - Device requires pairing PIN (check device screen)\n"
+                            "  - On Linux: user not in 'bluetooth' group\n"
+                            "  - Connection was interrupted\n\n"
+                            "Try:\n"
+                            "  - Restart Bluetooth on your computer\n"
+                            "  - Reset the Meshtastic device",
+                            1,
+                        )
+                    elif e.kind == BLEInterface.BLEError.READ_ERROR:
+                        meshtastic.util.our_exit(
+                            "Failed to read from BLE device.\n\n"
+                            "The device may have disconnected unexpectedly.\n\n"
+                            "Try:\n"
+                            "  - Move closer to the device\n"
+                            "  - Reset the Meshtastic device\n"
+                            "  - Restart Bluetooth on your computer",
+                            1,
+                        )
+                    else:
+                        meshtastic.util.our_exit(f"BLE error: {e}", 1)
             elif args.host:
                 try:
                     if ":" in args.host:
@@ -1471,6 +1756,23 @@ def common():
                     message += "  Please close any applications or webpages that may be using the device and try again.\n"
                     message += f"\nOriginal error: {ex}"
                     meshtastic.util.our_exit(message)
+                except MeshInterface.MeshInterfaceError as ex:
+                    msg = str(ex)
+                    if "Timed out" in msg:
+                        meshtastic.util.our_exit(
+                            "Connection timed out.\n\n"
+                            "Possible causes:\n"
+                            "  - Device is rebooting\n"
+                            "  - Device firmware is updating\n"
+                            "  - Serial connection was interrupted\n\n"
+                            "Try:\n"
+                            "  - Wait a few seconds and try again\n"
+                            "  - Check if device is fully booted (LED patterns)\n"
+                            "  - Reconnect the USB cable",
+                            1,
+                        )
+                    else:
+                        meshtastic.util.our_exit(f"Connection error: {ex}", 1)
                 if client.devPath is None:
                     try:
                         client = meshtastic.tcp_interface.TCPInterface(
@@ -1527,10 +1829,12 @@ def addConnectionArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--host",
         "--tcp",
         "-t",
-        help="Connect to a device using TCP, optionally passing hostname or IP address to use. (defaults to '%(const)s')",
+        help=("Connect to a device using TCP, optionally passing hostname or IP address to use. (defaults to '%(const)s'). "
+              "A port number may be specified as well, e.g. meshtastic.local:4404. The default port is 4403."),
         nargs="?",
         default=None,
         const="localhost",
+        metavar="HOST[:PORT]",
     )
 
     group.add_argument(
@@ -1583,7 +1887,9 @@ def addImportExportArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
 
     group.add_argument(
         "--configure",
-        help="Specify a path to a yaml(.yml) file containing the desired settings for the connected device.",
+        "--import-config",
+        dest="configure",
+        help="Specify a path to a configuration file to import. Autodetects format (yaml or binary protobuf).",
         action="append",
     )
     group.add_argument(
@@ -1591,7 +1897,13 @@ def addImportExportArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
         nargs="?",
         const="-",  # default to "-" if no value provided
         metavar="FILE",
-        help="Export device config as YAML (to stdout if no file given)"
+        help="Export device config (to stdout if no file given). Autodetects format by extension if possible."
+    )
+    group.add_argument(
+        "--export-format",
+        choices=["auto", "yaml", "binary", "protobuf"],
+        default="auto",
+        help="Format for export or import. 'auto' uses file extension or contents. 'binary' or 'protobuf' forces binary format. 'yaml' forces yaml."
     )
     return parser
 
@@ -1663,43 +1975,61 @@ def addConfigArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     group.add_argument(
         "--ch-vlongslow",
-        help="Change to the very long-range and slow modem preset",
+        help="Change to the VERY_LONG_SLOW modem preset. Deprecated since 2.5 firmware.",
         action="store_true",
     )
 
     group.add_argument(
         "--ch-longslow",
-        help="Change to the long-range and slow modem preset",
+        help="Change to the LONG_SLOW modem preset. Deprecated since 2.7 firmware.",
+        action="store_true",
+    )
+
+    group.add_argument(
+        "--ch-longmod", "--ch-longmoderate",
+        help="Change to the LONG_MODERATE modem preset",
         action="store_true",
     )
 
     group.add_argument(
         "--ch-longfast",
-        help="Change to the long-range and fast modem preset",
+        help="Change to the LONG_FAST modem preset",
+        action="store_true",
+    )
+
+    group.add_argument(
+        "--ch-longturbo",
+        help="Change to the LONG_TURBO preset",
         action="store_true",
     )
 
     group.add_argument(
         "--ch-medslow",
-        help="Change to the med-range and slow modem preset",
+        help="Change to the MEDIUM_SLOW modem preset",
         action="store_true",
     )
 
     group.add_argument(
         "--ch-medfast",
-        help="Change to the med-range and fast modem preset",
+        help="Change to the MEDIUM_FAST modem preset",
         action="store_true",
     )
 
     group.add_argument(
         "--ch-shortslow",
-        help="Change to the short-range and slow modem preset",
+        help="Change to the SHORT_SLOW modem preset",
         action="store_true",
     )
 
     group.add_argument(
         "--ch-shortfast",
-        help="Change to the short-range and fast modem preset",
+        help="Change to the SHORT_FAST modem preset",
+        action="store_true",
+    )
+
+    group.add_argument(
+        "--ch-shortturbo",
+        help="Change to the SHORT_TURBO modem preset",
         action="store_true",
     )
 
@@ -1791,6 +2121,24 @@ def addChannelConfigArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
     )
 
     group.add_argument(
+        "--contact-qr",
+        help="Display a QR code for a node's contact data. "
+        "Use the node ID with a '!' or '0x' prefix or the node number. "
+        "Also shows the shareable contact URL.",
+        metavar="!xxxxxxxx",
+    )
+    group.add_argument(
+        "--contact-verified",
+        help="Set the IS_KEY_MANUALLY_VERIFIED bit in the generated contact URL",
+        action="store_true",
+    )
+    group.add_argument(
+        "--contact-ignore",
+        help="Mark this contact as blocked/ignored in the generated contact URL",
+        action="store_true",
+    )
+
+    group.add_argument(
         "--ch-enable",
         help="Enable the specified channel. Use --ch-add instead whenever possible.",
         action="store_true",
@@ -1842,7 +2190,8 @@ def addPositionConfigArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentP
 
     group.add_argument(
         "--pos-fields",
-        help="Specify fields to send when sending a position. Use no argument for a list of valid values. "
+        help="Deprecated: use '--set position.position_flags FLAG1,FLAG2' instead. "
+        "Specify fields to send when sending a position. Use no argument for a list of valid values. "
         "Can pass multiple values as a space separated list like "
         "this: '--pos-fields ALTITUDE HEADING SPEED'",
         nargs="*",
@@ -1927,7 +2276,10 @@ def addRemoteActionArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     )
 
     group.add_argument(
-        "--reply", help="Reply to received messages", action="store_true"
+        "--reply",
+        help="Reply to received messages on the channel they were received. "
+        "If '--ch-index' is set, only messages on that channel are replied to.",
+        action="store_true",
     )
 
     return parser
@@ -2022,6 +2374,13 @@ def addRemoteAdminArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         "--reset-nodedb",
         help="Tell the destination node to clear its list of nodes",
         action="store_true",
+    )
+
+    group.add_argument(
+        "--add-contact",
+        help="Add a contact (User) to the NodeDB from a shareable URL. "
+        "Example: https://meshtastic.org/v/#<base64>",
+        metavar="URL",
     )
 
     group.add_argument(
